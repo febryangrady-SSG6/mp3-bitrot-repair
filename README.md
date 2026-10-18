@@ -54,7 +54,7 @@ The author built this after a ~15 GB lecture/recitation archive on an SD card tu
 | **1. Frame headers** | Rebuilds corrupted 4-byte headers and exact frame boundaries. CBR: Viterbi/DP over the padding bit to pick the lowest Hamming-distance header sequence between two healthy frame chains. VBR: scores candidate `(bitrate, padding)` pairs by current + next header. Handles `TAG`/APE/`ID3` footers and truncated end-of-file stubs. |
 | **2a. Side info / bit reservoir** | Clears flipped high bits so `main_data_begin <= reservoir`, `big_values <= 288`; fixes illegal `block_type`; replaces reserved Huffman tables (4, 14); clamps absurd `global_gain` near damaged frames; trims `part2_3_length` until it fits the frame (zeroing suspicious silent granules first). |
 | **Frame Repeat Concealment (`--repeat-last`)** | Replaces damaged clusters with the preceding clean frame's payload (`mdb = 0`, slot-padded bitstream) instead of synthesizing/capping audio parameters over corrupted main data. Completely eliminates audio glitches without reservoir drift. |
-| **Silence Concealment (`--mute`)** | Replaces damaged clusters with silent frames (`big_values = 0`, zeroed slot payload, balanced bit-reservoir consumption). Mutes corrupted sections smoothly without clicks or decode errors. |
+| **Silence Concealment (`--mute`)** | Replaces damaged clusters with silent frames (`big_values = 0`, zeroed slot payload, balanced bit-reservoir consumption). Smoothly fades volume in and out purely via `global_gain` (default: 0.5s, configurable via `--fade`) to avoid abrupt stops. |
 | **3. CRC (opt-in)** | `--update-crc` rewrites the embedded audio CRC-16 to match the repaired data. **Off by default** (see Limitations). |
 
 Other behaviour: in-place mode preserves owner (`uid:gid`) and timestamps; `--batch` repairs a file list in
@@ -145,7 +145,9 @@ find /path/to/music -iname '*.mp3' > filelist.txt
 
 # Concealment modes (substitutes corrupted audio instead of in-place repair):
 ./repair_mp3 --repeat-last broken.mp3 repaired_repeated.mp3   # repeat preceding clean sound
-./repair_mp3 --mute broken.mp3 repaired_muted.mp3             # mute damaged sections with silence
+./repair_mp3 --mute broken.mp3 repaired_muted.mp3             # mute damaged sections (default 0.5s volume fade)
+./repair_mp3 --mute --fade 1.0 broken.mp3 repaired_muted.mp3  # custom 1.0s fade-in & fade-out on volume
+./repair_mp3 --mute --fade 0 broken.mp3 repaired_muted.mp3    # instant mute (no fade)
 
 # Optional: also rewrite the embedded LAME/Lavc audio CRC (makes the CRC check pass; see Limitations #3)
 ./repair_mp3 --update-crc broken.mp3 repaired.mp3

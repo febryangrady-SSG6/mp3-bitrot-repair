@@ -1,7 +1,7 @@
 CC      ?= gcc
 CFLAGS  ?= -O3 -Wall -Wextra -fopenmp
 LDFLAGS ?= -fopenmp
-LDLIBS  ?= -lavutil
+LDLIBS  ?= -lavutil -lm
 
 BINDIR  ?= .
 TARGETS  = $(BINDIR)/scan_mp3 $(BINDIR)/repair_mp3

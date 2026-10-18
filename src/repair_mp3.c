@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <libavutil/crc.h>
 #include <omp.h>
+#include <math.h>
 
 static const int br_tab[3][16] = {
     {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
@@ -170,6 +171,8 @@ static int is_valid_chain(const uint8_t *data, long end_pos, long pos, int v0, i
 static int g_update_crc = 0;
 static int g_repeat_last = 0;
 static int g_mute = 0;
+static float g_fade_in = -1.0f;
+static float g_fade_out = -1.0f;
 
 int repair_file(const char *in_path, const char *out_path) {
     struct stat st;
@@ -581,6 +584,9 @@ int repair_file(const char *in_path, const char *out_path) {
         int med_ws  = clean_cnt > 0 ? calc_median(clean_ws, clean_cnt)  : 0;
         free(clean_p23); free(clean_bv); free(clean_gg); free(clean_ws);
 
+        float cur_fade_in = (g_fade_in >= 0.0f) ? g_fade_in : (g_mute ? 0.5f : 0.0f);
+        float cur_fade_out = (g_fade_out >= 0.0f) ? g_fade_out : (g_mute ? 0.5f : 0.0f);
+
         if (g_mute) {
             // Conceal damaged frame clusters by replacing them with silent frames
             for (int f = 0; f < nframes; f++) {
@@ -616,6 +622,95 @@ int repair_file(const char *in_path, const char *out_path) {
                         set_bits(si_f, bp + 21, 8, 210);
                     }
                 }
+            }
+
+            // Next, apply smooth volume fade-out and fade-in purely on volume (global_gain) around muted clusters
+            if (cur_fade_in > 0.0f || cur_fade_out > 0.0f) {
+                int srate = sr_tab[v0][si0];
+                int samples_per_frame = (v0 == 3) ? 1152 : 576;
+                float frame_dur = (float)samples_per_frame / (float)srate;
+                int fade_in_frames = (int)roundf(cur_fade_in / frame_dur);
+                int fade_out_frames = (int)roundf(cur_fade_out / frame_dur);
+                if (fade_in_frames < 1 && cur_fade_in > 0.0f) fade_in_frames = 1;
+                if (fade_out_frames < 1 && cur_fade_out > 0.0f) fade_out_frames = 1;
+
+                int G_out = fade_out_frames * ngr0;
+                int G_in = fade_in_frames * ngr0;
+
+                // Allocate gain envelope array: nframes * ngr0 floats
+                float *gain_env = malloc(nframes * ngr0 * sizeof(float));
+                for (int i = 0; i < nframes * ngr0; i++) gain_env[i] = 1.0f;
+
+                // Compute clusters and fill gain_env
+                int i = 0;
+                while (i < nframes) {
+                    if (!near_corrupt[i] || (i == 0 && has_xing)) { i++; continue; }
+                    int c_start = i;
+                    while (i < nframes && near_corrupt[i]) i++;
+                    int c_end = i - 1;
+
+                    // Within the muted cluster, gain is 0.0f
+                    for (int f = c_start; f <= c_end; f++) {
+                        for (int gr = 0; gr < ngr0; gr++) {
+                            gain_env[f * ngr0 + gr] = 0.0f;
+                        }
+                    }
+
+                    // Fade out preceding clean frames
+                    if (G_out > 0) {
+                        for (int d_f = 1; d_f <= fade_out_frames; d_f++) {
+                            int f = c_start - d_f;
+                            if (f <= 0 || near_corrupt[f]) break;
+                            for (int gr = ngr0 - 1; gr >= 0; gr--) {
+                                int g_dist = (d_f - 1) * ngr0 + (ngr0 - 1 - gr) + 1;
+                                float v = (float)g_dist / (float)G_out;
+                                if (v < gain_env[f * ngr0 + gr]) {
+                                    gain_env[f * ngr0 + gr] = v;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fade in succeeding clean frames
+                    if (G_in > 0) {
+                        for (int d_f = 1; d_f <= fade_in_frames; d_f++) {
+                            int f = c_end + d_f;
+                            if (f >= nframes || near_corrupt[f]) break;
+                            for (int gr = 0; gr < ngr0; gr++) {
+                                int g_dist = (d_f - 1) * ngr0 + gr + 1;
+                                float v = (float)g_dist / (float)G_in;
+                                if (v < gain_env[f * ngr0 + gr]) {
+                                    gain_env[f * ngr0 + gr] = v;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply volume modulation purely via global_gain to fading frames
+                int active_ch_end = (file_ch1_is_silent && nch0 == 2) ? 1 : nch0;
+                for (int f = 1; f < nframes; f++) {
+                    if (near_corrupt[f]) continue;
+                    long f_off = frame_offs[f];
+                    if (f_off + hdr_len0 + si_len0_pass2 > end_pos) continue;
+                    uint8_t *si_f = data + f_off + hdr_len0;
+
+                    for (int gr = 0; gr < ngr0; gr++) {
+                        float v = gain_env[f * ngr0 + gr];
+                        if (v < 0.999f) {
+                            int d_gg = (v <= 0.001f) ? -40 : (int)roundf(4.0f * log2f(v));
+                            for (int ch = 0; ch < active_ch_end; ch++) {
+                                int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                                int old_gg = (int)get_bits(si_f, bp + 21, 8);
+                                int new_gg = old_gg + d_gg;
+                                if (new_gg < 0) new_gg = 0;
+                                if (new_gg > 255) new_gg = 255;
+                                set_bits(si_f, bp + 21, 8, (uint32_t)new_gg);
+                            }
+                        }
+                    }
+                }
+                free(gain_env);
             }
         } else if (g_repeat_last) {
             // Conceal damaged frame clusters by repeating the preceding clean frame
@@ -966,6 +1061,11 @@ static void print_usage(const char *prog) {
         "                 frame instead of repairing bitstream parameters in-place.\n"
         "  --mute         Conceal damaged frame clusters by replacing them with silent frames\n"
         "                 (muting damaged sections without pops or bit-reservoir drift).\n"
+        "  --fade <sec>   Fade-in and fade-out duration in seconds for muting (default: 0.5s).\n"
+        "                 Fade is performed purely on volume (global_gain) without modifying\n"
+        "                 spectral data. Set to 0 to disable fading.\n"
+        "  --fade-in <sec>  Set fade-in duration specifically.\n"
+        "  --fade-out <sec> Set fade-out duration specifically.\n"
         "  --update-crc   Also rewrite the embedded LAME/Lavc audio CRC-16 so it matches the repaired data.\n"
         "                 Off by default: the original CRC is the only ground-truth checksum in the file.\n",
         prog, prog, prog);
@@ -978,7 +1078,23 @@ int main(int argc, char **argv) {
             if (strcmp(argv[r], "--update-crc") == 0) g_update_crc = 1;
             else if (strcmp(argv[r], "--repeat-last") == 0) g_repeat_last = 1;
             else if (strcmp(argv[r], "--mute") == 0) g_mute = 1;
-            else argv[w++] = argv[r];
+            else if (strcmp(argv[r], "--fade") == 0 && r + 1 < argc) {
+                float v = (float)atof(argv[++r]);
+                g_fade_in = v;
+                g_fade_out = v;
+            } else if (strncmp(argv[r], "--fade=", 7) == 0) {
+                float v = (float)atof(argv[r] + 7);
+                g_fade_in = v;
+                g_fade_out = v;
+            } else if (strcmp(argv[r], "--fade-in") == 0 && r + 1 < argc) {
+                g_fade_in = (float)atof(argv[++r]);
+            } else if (strncmp(argv[r], "--fade-in=", 10) == 0) {
+                g_fade_in = (float)atof(argv[r] + 10);
+            } else if (strcmp(argv[r], "--fade-out") == 0 && r + 1 < argc) {
+                g_fade_out = (float)atof(argv[++r]);
+            } else if (strncmp(argv[r], "--fade-out=", 11) == 0) {
+                g_fade_out = (float)atof(argv[r] + 11);
+            } else argv[w++] = argv[r];
         }
         argc = w;
     }

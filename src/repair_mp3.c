@@ -169,6 +169,7 @@ static int is_valid_chain(const uint8_t *data, long end_pos, long pos, int v0, i
  * ground-truth oracle in the file, so by default we preserve it instead of forging a passing value. */
 static int g_update_crc = 0;
 static int g_repeat_last = 0;
+static int g_mute = 0;
 
 int repair_file(const char *in_path, const char *out_path) {
     struct stat st;
@@ -580,7 +581,43 @@ int repair_file(const char *in_path, const char *out_path) {
         int med_ws  = clean_cnt > 0 ? calc_median(clean_ws, clean_cnt)  : 0;
         free(clean_p23); free(clean_bv); free(clean_gg); free(clean_ws);
 
-        if (g_repeat_last) {
+        if (g_mute) {
+            // Conceal damaged frame clusters by replacing them with silent frames
+            for (int f = 0; f < nframes; f++) {
+                if (!near_corrupt[f] || (f == 0 && has_xing)) continue;
+                int slot_sz = frame_sizes[f] - hdr_len0 - si_len0_pass2;
+                long f_off = frame_offs[f];
+                if (f_off + hdr_len0 + si_len0_pass2 + slot_sz > end_pos) continue;
+
+                uint8_t *slot_ptr = data + f_off + hdr_len0 + si_len0_pass2;
+                if (slot_sz > 0) memset(slot_ptr, 0, slot_sz);
+
+                uint8_t *si_f = data + f_off + hdr_len0;
+                memset(si_f, 0, si_len0_pass2);
+
+                int active_ch_end = (file_ch1_is_silent && nch0 == 2) ? 1 : nch0;
+                int rem_p23 = slot_sz * 8;
+                for (int gr = ngr0 - 1; gr >= 0 && rem_p23 > 0; gr--) {
+                    for (int ch = active_ch_end - 1; ch >= 0 && rem_p23 > 0; ch--) {
+                        int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                        int add = (rem_p23 > 4000) ? 4000 : rem_p23;
+                        set_bits(si_f, bp, 12, (uint32_t)add);
+                        set_bits(si_f, bp + 12, 9, 0);
+                        set_bits(si_f, bp + 21, 8, 0);
+                        rem_p23 -= add;
+                    }
+                }
+
+                if (file_ch1_is_silent && nch0 == 2) {
+                    for (int gr = 0; gr < ngr0; gr++) {
+                        int bp = base_bp0 + (gr * nch0 + 1) * gr_bits0;
+                        set_bits(si_f, bp, 12, 0);
+                        set_bits(si_f, bp + 12, 9, 0);
+                        set_bits(si_f, bp + 21, 8, 210);
+                    }
+                }
+            }
+        } else if (g_repeat_last) {
             // Conceal damaged frame clusters by repeating the preceding clean frame
             long *cum_slots = malloc((nframes + 1) * sizeof(long));
             cum_slots[0] = 0;
@@ -927,6 +964,8 @@ static void print_usage(const char *prog) {
         "Options (may appear anywhere):\n"
         "  --repeat-last  Conceal damaged frame clusters by repeating the preceding clean\n"
         "                 frame instead of repairing bitstream parameters in-place.\n"
+        "  --mute         Conceal damaged frame clusters by replacing them with silent frames\n"
+        "                 (muting damaged sections without pops or bit-reservoir drift).\n"
         "  --update-crc   Also rewrite the embedded LAME/Lavc audio CRC-16 so it matches the repaired data.\n"
         "                 Off by default: the original CRC is the only ground-truth checksum in the file.\n",
         prog, prog, prog);
@@ -938,6 +977,7 @@ int main(int argc, char **argv) {
         for (int r = 1; r < argc; r++) {
             if (strcmp(argv[r], "--update-crc") == 0) g_update_crc = 1;
             else if (strcmp(argv[r], "--repeat-last") == 0) g_repeat_last = 1;
+            else if (strcmp(argv[r], "--mute") == 0) g_mute = 1;
             else argv[w++] = argv[r];
         }
         argc = w;

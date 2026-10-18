@@ -54,6 +54,7 @@ The author built this after a ~15 GB lecture/recitation archive on an SD card tu
 | **1. Frame headers** | Rebuilds corrupted 4-byte headers and exact frame boundaries. CBR: Viterbi/DP over the padding bit to pick the lowest Hamming-distance header sequence between two healthy frame chains. VBR: scores candidate `(bitrate, padding)` pairs by current + next header. Handles `TAG`/APE/`ID3` footers and truncated end-of-file stubs. |
 | **2a. Side info / bit reservoir** | Clears flipped high bits so `main_data_begin <= reservoir`, `big_values <= 288`; fixes illegal `block_type`; replaces reserved Huffman tables (4, 14); clamps absurd `global_gain` near damaged frames; trims `part2_3_length` until it fits the frame (zeroing suspicious silent granules first). |
 | **2b. De-clicking** | 40-frame sliding window per channel: resets bit-flipped *silent* channels/granules (e.g. the Side channel of mono-in-joint-stereo), clamps `global_gain`/`big_values` outliers to the local average, repairs high-`linbits` `table_select` flips (e.g. table 26/27 turning into 30/31, which makes a single escape code produce a full-scale pop) and false `window_switching_flag`. |
+| **Concealment Mode (`--repeat-last`)** | Replaces damaged clusters with the preceding clean frame's payload (`mdb = 0`, slot-padded bitstream) instead of synthesizing/capping audio parameters over corrupted main data. Completely eliminates audio glitches without reservoir drift. |
 | **3. CRC (opt-in)** | `--update-crc` rewrites the embedded audio CRC-16 to match the repaired data. **Off by default** (see Limitations). |
 
 Other behaviour: in-place mode preserves owner (`uid:gid`) and timestamps; `--batch` repairs a file list in
@@ -141,6 +142,9 @@ find /path/to/music -iname '*.mp3' > filelist.txt
 # 3) Repair in place / in parallel (BACK UP FIRST)
 ./repair_mp3 --in-place broken.mp3
 ./repair_mp3 --batch broken_list.txt
+
+# Concealment mode: repeat preceding clean frame over damaged clusters (avoids audio warbles)
+./repair_mp3 --repeat-last broken.mp3 repaired_repeated.mp3
 
 # Optional: also rewrite the embedded LAME/Lavc audio CRC (makes the CRC check pass; see Limitations #3)
 ./repair_mp3 --update-crc broken.mp3 repaired.mp3

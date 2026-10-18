@@ -168,6 +168,7 @@ static int is_valid_chain(const uint8_t *data, long end_pos, long pos, int v0, i
 /* Pass 3 (rewriting the embedded LAME/Lavc audio CRC) is opt-in: the original CRC is the only
  * ground-truth oracle in the file, so by default we preserve it instead of forging a passing value. */
 static int g_update_crc = 0;
+static int g_repeat_last = 0;
 
 int repair_file(const char *in_path, const char *out_path) {
     struct stat st;
@@ -579,170 +580,298 @@ int repair_file(const char *in_path, const char *out_path) {
         int med_ws  = clean_cnt > 0 ? calc_median(clean_ws, clean_cnt)  : 0;
         free(clean_p23); free(clean_bv); free(clean_gg); free(clean_ws);
 
-        // MDB single-bit flip repair
-        int mdb_window[11];
-        for (int i = 0; i < nframes; i++) {
-            if (!near_corrupt[i]) continue;
-            int wcnt = 0;
-            int k0 = (i >= 5) ? i - 5 : 0;
-            int k1 = (i + 5 < nframes) ? i + 5 : nframes - 1;
-            for (int k = k0; k <= k1; k++) {
-                if (!near_corrupt[k]) mdb_window[wcnt++] = orig_mdb[k];
+        if (g_repeat_last) {
+            // Conceal damaged frame clusters by repeating the preceding clean frame
+            long *cum_slots = malloc((nframes + 1) * sizeof(long));
+            cum_slots[0] = 0;
+            for (int i = 0; i < nframes; i++) {
+                int slot_sz = frame_sizes[i] - hdr_len0 - si_len0_pass2;
+                if (slot_sz < 0) slot_sz = 0;
+                cum_slots[i + 1] = cum_slots[i] + slot_sz;
             }
-            if (wcnt == 0) {
-                for (int k = k0; k <= k1; k++) mdb_window[wcnt++] = orig_mdb[k];
-            }
-            int med_m = calc_median(mdb_window, wcnt);
-            int cur_m = orig_mdb[i];
-            if (abs(cur_m - med_m) > 40) {
-                for (int b = 0; b < mdb_bits0; b++) {
-                    int cand = cur_m ^ (1 << b);
-                    if (abs(cand - med_m) <= 35) {
-                        orig_mdb[i] = cand;
-                        long f_off = frame_offs[i];
-                        uint8_t *si = data + f_off + hdr_len0;
-                        set_bits(si, 0, mdb_bits0, cand);
+
+            int i = 0;
+            while (i < nframes) {
+                if (!near_corrupt[i] || (i == 0 && has_xing)) {
+                    i++;
+                    continue;
+                }
+                int c_start = i;
+                while (i < nframes && near_corrupt[i]) i++;
+                int c_end = i - 1;
+
+                // Find preceding clean frame with clean_p23 <= slot_sz * 8
+                int good_f = -1;
+                int ref_slot = frame_sizes[c_start] - hdr_len0 - si_len0_pass2;
+                for (int cand = c_start - 1; cand >= 0; cand--) {
+                    if (near_corrupt[cand] || (cand == 0 && has_xing)) continue;
+                    uint8_t *si_cand = data + frame_offs[cand] + hdr_len0;
+                    int p_tot = 0;
+                    for (int gr = 0; gr < ngr0; gr++) {
+                        for (int ch = 0; ch < nch0; ch++) {
+                            p_tot += get_bits(si_cand, base_bp0 + (gr * nch0 + ch) * gr_bits0, 12);
+                        }
+                    }
+                    if (p_tot > 0 && p_tot <= ref_slot * 8) {
+                        good_f = cand;
                         break;
                     }
+                    if (good_f == -1 && p_tot > 0) good_f = cand;
                 }
-            }
-        }
+                if (good_f == -1) {
+                    for (int cand = c_end + 1; cand < nframes; cand++) {
+                        if (near_corrupt[cand]) continue;
+                        uint8_t *si_cand = data + frame_offs[cand] + hdr_len0;
+                        int p_tot = 0;
+                        for (int gr = 0; gr < ngr0; gr++) {
+                            for (int ch = 0; ch < nch0; ch++) {
+                                p_tot += get_bits(si_cand, base_bp0 + (gr * nch0 + ch) * gr_bits0, 12);
+                            }
+                        }
+                        if (p_tot > 0 && p_tot <= ref_slot * 8) {
+                            good_f = cand;
+                            break;
+                        }
+                        if (good_f == -1 && p_tot > 0) good_f = cand;
+                    }
+                }
 
-        // Execute targeted repair & reservoir tracking
-        long reservoir_bytes = 0;
-        for (int i = 0; i < nframes; i++) {
-            if (i == 0 && has_xing) {
-                reservoir_bytes = 0;
-                continue;
-            }
-            long f_off = frame_offs[i];
-            int fs = frame_sizes[i];
-            if (f_off + hdr_len0 + si_len0_pass2 > end_pos) continue;
-
-            uint8_t *si = data + f_off + hdr_len0;
-            uint32_t mdb = get_bits(si, 0, mdb_bits0);
-
-            if (near_corrupt[i]) {
-                // Repair silent channel if present
-                if (file_ch1_is_silent && nch0 == 2) {
+                if (good_f != -1) {
+                    uint8_t *si_good = data + frame_offs[good_f] + hdr_len0;
+                    int mdb_good = get_bits(si_good, 0, mdb_bits0);
+                    int clean_p23 = 0;
                     for (int gr = 0; gr < ngr0; gr++) {
-                        int bp = base_bp0 + (gr * nch0 + 1) * gr_bits0;
-                        set_bits(si, bp, 12, 0);
-                        set_bits(si, bp + 12, 9, 0);
-                        set_bits(si, bp + 21, 8, 210);
-                        set_bits(si, bp + 29, sfc_len0, 0);
-                        set_bits(si, bp + 29 + sfc_len0, 1, 0);
+                        for (int ch = 0; ch < nch0; ch++) {
+                            clean_p23 += get_bits(si_good, base_bp0 + (gr * nch0 + ch) * gr_bits0, 12);
+                        }
+                    }
+                    int clean_nbytes = (clean_p23 + 7) / 8;
+                    long start_cum = cum_slots[good_f] - mdb_good;
+                    if (start_cum < 0) start_cum = 0;
+
+                    uint8_t *clean_mb = malloc(clean_nbytes > 0 ? clean_nbytes : 1);
+                    long slot_idx = 0;
+                    for (int b = 0; b < clean_nbytes; b++) {
+                        long pos_cum = start_cum + b;
+                        while (slot_idx + 1 < nframes && cum_slots[slot_idx + 1] <= pos_cum) slot_idx++;
+                        long offset_in_slot = pos_cum - cum_slots[slot_idx];
+                        long byte_file_pos = frame_offs[slot_idx] + hdr_len0 + si_len0_pass2 + offset_in_slot;
+                        clean_mb[b] = (byte_file_pos < end_pos) ? data[byte_file_pos] : 0;
+                    }
+
+                    for (int f = c_start; f <= c_end; f++) {
+                        int slot_sz = frame_sizes[f] - hdr_len0 - si_len0_pass2;
+                        long f_off = frame_offs[f];
+                        if (f_off + hdr_len0 + si_len0_pass2 + slot_sz > end_pos) continue;
+
+                        uint8_t *slot_ptr = data + f_off + hdr_len0 + si_len0_pass2;
+                        int copy_len = (clean_nbytes < slot_sz) ? clean_nbytes : slot_sz;
+                        memcpy(slot_ptr, clean_mb, copy_len);
+                        if (slot_sz > copy_len) {
+                            memset(slot_ptr + copy_len, 0, slot_sz - copy_len);
+                        }
+
+                        uint8_t *si_f = data + f_off + hdr_len0;
+                        memcpy(si_f, si_good, si_len0_pass2);
+                        set_bits(si_f, 0, mdb_bits0, 0);
+
+                        int target_p23 = slot_sz * 8;
+                        int diff = target_p23 - clean_p23;
+                        if (diff > 0) {
+                            for (int gr = ngr0 - 1; gr >= 0 && diff > 0; gr--) {
+                                for (int ch = nch0 - 1; ch >= 0 && diff > 0; ch--) {
+                                    if (file_ch1_is_silent && ch == 1) continue;
+                                    int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                                    uint32_t p = get_bits(si_f, bp, 12);
+                                    uint32_t add = (diff > (4000 - (int)p)) ? (uint32_t)(4000 - (int)p) : (uint32_t)diff;
+                                    set_bits(si_f, bp, 12, p + add);
+                                    diff -= add;
+                                }
+                            }
+                        } else if (diff < 0) {
+                            int excess = -diff;
+                            for (int gr = ngr0 - 1; gr >= 0 && excess > 0; gr--) {
+                                for (int ch = nch0 - 1; ch >= 0 && excess > 0; ch--) {
+                                    if (file_ch1_is_silent && ch == 1) continue;
+                                    int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                                    uint32_t p = get_bits(si_f, bp, 12);
+                                    uint32_t sub = (excess < (int)p) ? (uint32_t)excess : p;
+                                    set_bits(si_f, bp, 12, p - sub);
+                                    excess -= sub;
+                                }
+                            }
+                        }
+                    }
+                    free(clean_mb);
+                }
+            }
+            free(cum_slots);
+        } else {
+            // MDB single-bit flip repair
+            int mdb_window[11];
+            for (int i = 0; i < nframes; i++) {
+                if (!near_corrupt[i]) continue;
+                int wcnt = 0;
+                int k0 = (i >= 5) ? i - 5 : 0;
+                int k1 = (i + 5 < nframes) ? i + 5 : nframes - 1;
+                for (int k = k0; k <= k1; k++) {
+                    if (!near_corrupt[k]) mdb_window[wcnt++] = orig_mdb[k];
+                }
+                if (wcnt == 0) {
+                    for (int k = k0; k <= k1; k++) mdb_window[wcnt++] = orig_mdb[k];
+                }
+                int med_m = calc_median(mdb_window, wcnt);
+                int cur_m = orig_mdb[i];
+                if (abs(cur_m - med_m) > 40) {
+                    for (int b = 0; b < mdb_bits0; b++) {
+                        int cand = cur_m ^ (1 << b);
+                        if (abs(cand - med_m) <= 35) {
+                            orig_mdb[i] = cand;
+                            long f_off = frame_offs[i];
+                            uint8_t *si = data + f_off + hdr_len0;
+                            set_bits(si, 0, mdb_bits0, cand);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Execute targeted repair & reservoir tracking
+            long reservoir_bytes = 0;
+            for (int i = 0; i < nframes; i++) {
+                if (i == 0 && has_xing) {
+                    reservoir_bytes = 0;
+                    continue;
+                }
+                long f_off = frame_offs[i];
+                int fs = frame_sizes[i];
+                if (f_off + hdr_len0 + si_len0_pass2 > end_pos) continue;
+
+                uint8_t *si = data + f_off + hdr_len0;
+                uint32_t mdb = get_bits(si, 0, mdb_bits0);
+
+                if (near_corrupt[i]) {
+                    // Repair silent channel if present
+                    if (file_ch1_is_silent && nch0 == 2) {
+                        for (int gr = 0; gr < ngr0; gr++) {
+                            int bp = base_bp0 + (gr * nch0 + 1) * gr_bits0;
+                            set_bits(si, bp, 12, 0);
+                            set_bits(si, bp + 12, 9, 0);
+                            set_bits(si, bp + 21, 8, 210);
+                            set_bits(si, bp + 29, sfc_len0, 0);
+                            set_bits(si, bp + 29 + sfc_len0, 1, 0);
+                        }
+                    }
+
+                    // Repair active channel
+                    int active_ch_end = (file_ch1_is_silent && nch0 == 2) ? 1 : nch0;
+                    for (int gr = 0; gr < ngr0; gr++) {
+                        for (int ch = 0; ch < active_ch_end; ch++) {
+                            int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                            uint32_t p23 = get_bits(si, bp, 12);
+                            uint32_t bv  = get_bits(si, bp + 12, 9);
+                            uint32_t gg  = get_bits(si, bp + 21, 8);
+                            uint32_t ws  = get_bits(si, bp + 29 + sfc_len0, 1);
+                            int tbl_bp = bp + 30 + sfc_len0;
+
+                            // Single bit-flip repair for p23
+                            if (abs((int)p23 - med_p23) >= 300) {
+                                for (int b = 11; b >= 9; b--) {
+                                    if (abs((int)(p23 ^ (1 << b)) - med_p23) < 300) {
+                                        p23 ^= (1 << b);
+                                        set_bits(si, bp, 12, p23);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (p23 >= 2048) { p23 &= ~2048; set_bits(si, bp, 12, p23); }
+                            if (p23 >= 1024 && (int)p23 - 1024 > 300) { p23 &= ~1024; set_bits(si, bp, 12, p23); }
+
+                            // Single bit-flip repair for bv
+                            if (abs((int)bv - med_bv) >= 25) {
+                                for (int b = 8; b >= 5; b--) {
+                                    if (abs((int)(bv ^ (1 << b)) - med_bv) <= 10) {
+                                        bv ^= (1 << b);
+                                        set_bits(si, bp + 12, 9, bv);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (bv > 288) { bv &= 0x7F; set_bits(si, bp + 12, 9, bv); }
+
+                            // Single bit-flip repair for gg
+                            if (abs((int)gg - med_gg) >= 15) {
+                                for (int b = 7; b >= 4; b--) {
+                                    if (abs((int)(gg ^ (1 << b)) - med_gg) <= 6) {
+                                        gg ^= (1 << b);
+                                        set_bits(si, bp + 21, 8, gg);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (gg > 195 && gg != 210) { gg &= ~0x40; set_bits(si, bp + 21, 8, gg); }
+
+                            // ws flag
+                            if (med_ws == 0 && ws) {
+                                ws = 0;
+                                set_bits(si, bp + 29 + sfc_len0, 1, 0);
+                            } else if (ws && get_bits(si, tbl_bp, 2) == 0) {
+                                ws = 0;
+                                set_bits(si, bp + 29 + sfc_len0, 1, 0);
+                            }
+
+                            // Table select reserved / high linbits check
+                            if (ws) {
+                                for (int t = 0; t < 2; t++) {
+                                    uint32_t ts = get_bits(si, tbl_bp + 3 + t * 5, 5);
+                                    if (ts == 4) set_bits(si, tbl_bp + 3 + t * 5, 5, 0);
+                                    else if (ts == 14) set_bits(si, tbl_bp + 3 + t * 5, 5, 15);
+                                    else if (ts >= 28) set_bits(si, tbl_bp + 3 + t * 5, 5, ts & ~4);
+                                }
+                            } else {
+                                for (int t = 0; t < 3; t++) {
+                                    uint32_t ts = get_bits(si, tbl_bp + t * 5, 5);
+                                    if (ts == 4) set_bits(si, tbl_bp + t * 5, 5, 0);
+                                    else if (ts == 14) set_bits(si, tbl_bp + t * 5, 5, 15);
+                                    else if (ts >= 28) set_bits(si, tbl_bp + t * 5, 5, ts & ~4);
+                                }
+                            }
+                        }
                     }
                 }
 
-                // Repair active channel
-                int active_ch_end = (file_ch1_is_silent && nch0 == 2) ? 1 : nch0;
+                // Bit reservoir invariant (prevent cascade underflow!)
+                if (reservoir_bytes < (long)mdb) reservoir_bytes = mdb;
+                long main_data_slots = fs - hdr_len0 - si_len0_pass2;
+                long avail_bits = (mdb + main_data_slots) * 8;
+
+                long total_p23 = 0;
                 for (int gr = 0; gr < ngr0; gr++) {
-                    for (int ch = 0; ch < active_ch_end; ch++) {
+                    for (int ch = 0; ch < nch0; ch++) {
                         int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
-                        uint32_t p23 = get_bits(si, bp, 12);
-                        uint32_t bv  = get_bits(si, bp + 12, 9);
-                        uint32_t gg  = get_bits(si, bp + 21, 8);
-                        uint32_t ws  = get_bits(si, bp + 29 + sfc_len0, 1);
-                        int tbl_bp = bp + 30 + sfc_len0;
-
-                        // Single bit-flip repair for p23
-                        if (abs((int)p23 - med_p23) >= 300) {
-                            for (int b = 11; b >= 9; b--) {
-                                if (abs((int)(p23 ^ (1 << b)) - med_p23) < 300) {
-                                    p23 ^= (1 << b);
-                                    set_bits(si, bp, 12, p23);
-                                    break;
-                                }
-                            }
-                        }
-                        if (p23 >= 2048) { p23 &= ~2048; set_bits(si, bp, 12, p23); }
-                        if (p23 >= 1024 && (int)p23 - 1024 > 300) { p23 &= ~1024; set_bits(si, bp, 12, p23); }
-
-                        // Single bit-flip repair for bv
-                        if (abs((int)bv - med_bv) >= 25) {
-                            for (int b = 8; b >= 5; b--) {
-                                if (abs((int)(bv ^ (1 << b)) - med_bv) <= 10) {
-                                    bv ^= (1 << b);
-                                    set_bits(si, bp + 12, 9, bv);
-                                    break;
-                                }
-                            }
-                        }
-                        if (bv > 288) { bv &= 0x7F; set_bits(si, bp + 12, 9, bv); }
-
-                        // Single bit-flip repair for gg
-                        if (abs((int)gg - med_gg) >= 15) {
-                            for (int b = 7; b >= 4; b--) {
-                                if (abs((int)(gg ^ (1 << b)) - med_gg) <= 6) {
-                                    gg ^= (1 << b);
-                                    set_bits(si, bp + 21, 8, gg);
-                                    break;
-                                }
-                            }
-                        }
-                        if (gg > 195 && gg != 210) { gg &= ~0x40; set_bits(si, bp + 21, 8, gg); }
-
-                        // ws flag
-                        if (med_ws == 0 && ws) {
-                            ws = 0;
-                            set_bits(si, bp + 29 + sfc_len0, 1, 0);
-                        } else if (ws && get_bits(si, tbl_bp, 2) == 0) {
-                            ws = 0;
-                            set_bits(si, bp + 29 + sfc_len0, 1, 0);
-                        }
-
-                        // Table select reserved / high linbits check
-                        if (ws) {
-                            for (int t = 0; t < 2; t++) {
-                                uint32_t ts = get_bits(si, tbl_bp + 3 + t * 5, 5);
-                                if (ts == 4) set_bits(si, tbl_bp + 3 + t * 5, 5, 0);
-                                else if (ts == 14) set_bits(si, tbl_bp + 3 + t * 5, 5, 15);
-                                else if (ts >= 28) set_bits(si, tbl_bp + 3 + t * 5, 5, ts & ~4);
-                            }
-                        } else {
-                            for (int t = 0; t < 3; t++) {
-                                uint32_t ts = get_bits(si, tbl_bp + t * 5, 5);
-                                if (ts == 4) set_bits(si, tbl_bp + t * 5, 5, 0);
-                                else if (ts == 14) set_bits(si, tbl_bp + t * 5, 5, 15);
-                                else if (ts >= 28) set_bits(si, tbl_bp + t * 5, 5, ts & ~4);
-                            }
-                        }
+                        total_p23 += get_bits(si, bp, 12);
                     }
                 }
-            }
 
-            // Bit reservoir invariant (prevent cascade underflow!)
-            if (reservoir_bytes < (long)mdb) reservoir_bytes = mdb;
-            long main_data_slots = fs - hdr_len0 - si_len0_pass2;
-            long avail_bits = (mdb + main_data_slots) * 8;
-
-            long total_p23 = 0;
-            for (int gr = 0; gr < ngr0; gr++) {
-                for (int ch = 0; ch < nch0; ch++) {
-                    int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
-                    total_p23 += get_bits(si, bp, 12);
-                }
-            }
-
-            if (total_p23 > avail_bits && near_corrupt[i]) {
-                long diff = total_p23 - avail_bits;
-                for (int gr = ngr0 - 1; gr >= 0 && diff > 0; gr--) {
-                    for (int ch = nch0 - 1; ch >= 0 && diff > 0; ch--) {
-                        int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
-                        uint32_t p = get_bits(si, bp, 12);
-                        uint32_t sub = (diff < p) ? diff : p;
-                        set_bits(si, bp, 12, p - sub);
-                        diff -= sub;
+                if (total_p23 > avail_bits && near_corrupt[i]) {
+                    long diff = total_p23 - avail_bits;
+                    for (int gr = ngr0 - 1; gr >= 0 && diff > 0; gr--) {
+                        for (int ch = nch0 - 1; ch >= 0 && diff > 0; ch--) {
+                            int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                            uint32_t p = get_bits(si, bp, 12);
+                            uint32_t sub = (diff < p) ? diff : p;
+                            set_bits(si, bp, 12, p - sub);
+                            diff -= sub;
+                        }
                     }
+                    total_p23 = avail_bits;
                 }
-                total_p23 = avail_bits;
-            }
 
-            reservoir_bytes = (avail_bits - total_p23) / 8;
-            if (reservoir_bytes < 0) reservoir_bytes = 0;
-            long max_res = (v0 == 3) ? 511 : 255;
-            if (reservoir_bytes > max_res) reservoir_bytes = max_res;
+                reservoir_bytes = (avail_bits - total_p23) / 8;
+                if (reservoir_bytes < 0) reservoir_bytes = 0;
+                long max_res = (v0 == 3) ? 511 : 255;
+                if (reservoir_bytes > max_res) reservoir_bytes = max_res;
+            }
         }
 
         free(near_corrupt);
@@ -796,6 +925,8 @@ static void print_usage(const char *prog) {
         "  %s --batch <filelist.txt>       Repair all MP3 files listed in <filelist.txt> in parallel (OpenMP)\n"
         "\n"
         "Options (may appear anywhere):\n"
+        "  --repeat-last  Conceal damaged frame clusters by repeating the preceding clean\n"
+        "                 frame instead of repairing bitstream parameters in-place.\n"
         "  --update-crc   Also rewrite the embedded LAME/Lavc audio CRC-16 so it matches the repaired data.\n"
         "                 Off by default: the original CRC is the only ground-truth checksum in the file.\n",
         prog, prog, prog);
@@ -806,6 +937,7 @@ int main(int argc, char **argv) {
         int w = 1;
         for (int r = 1; r < argc; r++) {
             if (strcmp(argv[r], "--update-crc") == 0) g_update_crc = 1;
+            else if (strcmp(argv[r], "--repeat-last") == 0) g_repeat_last = 1;
             else argv[w++] = argv[r];
         }
         argc = w;

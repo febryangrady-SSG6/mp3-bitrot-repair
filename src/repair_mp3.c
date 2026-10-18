@@ -221,8 +221,9 @@ int repair_file(const char *in_path, const char *out_path) {
         pos += 10 + sz;
     }
 
+    int has_id3v1 = (fsize >= 128 && memcmp(data + fsize - 128, "TAG", 3) == 0);
     long end_pos = fsize;
-    if (end_pos >= 128 && memcmp(data + end_pos - 128, "TAG", 3) == 0) end_pos -= 128;
+    if (has_id3v1) end_pos -= 128;
     if (end_pos >= 32 && memcmp(data + end_pos - 32, "APETAGEX", 8) == 0) {
         uint32_t ape_sz = (uint32_t)data[end_pos-20] | ((uint32_t)data[end_pos-19]<<8) |
                           ((uint32_t)data[end_pos-18]<<16) | ((uint32_t)data[end_pos-17]<<24);
@@ -453,24 +454,13 @@ int repair_file(const char *in_path, const char *out_path) {
             end_pos -= 128;
             break;
         }
-        int hdr_len = 4 + (p0 == 0 ? 2 : 0);
-        int si_len = (v0 == 3) ? (cm0 == 3 ? 17 : 32) : (cm0 == 3 ? 9 : 17);
         int base_fs = calc_fsize(v0, l0, bi0, si0, 0);
         if (rem >= base_fs && base_fs > 0) {
             memset(data + cur, 0, base_fs);
             write_u32(data + cur, make_hdr_u32(v0, l0, p0, bi0, si0, 0, cm0, b3_low6));
             cur += base_fs;
-        } else if (rem >= hdr_len + si_len) {
-            memset(data + cur, 0, rem);
-            write_u32(data + cur, make_hdr_u32(v0, l0, p0, bi0, si0, 0, cm0, b3_low6));
-            cur = end_pos;
-        } else if (nframes > 0 && bi0 < 14) {
-            long prev = frame_offs[nframes - 1];
-            memset(data + prev + 4, 0, end_pos - (prev + 4));
-            write_u32(data + prev, make_hdr_u32(v0, l0, p0, bi0 + 1, si0, 0, cm0, b3_low6));
-            nframes--;
-            cur = end_pos;
         } else {
+            if (rem > 0) memset(data + cur, 0, rem);
             break;
         }
     }
@@ -521,6 +511,10 @@ int repair_file(const char *in_path, const char *out_path) {
 
             if (frame_corrupt[i]) continue;
 
+            long main_data_slots = frame_sizes[i] - hdr_len0 - si_len0_pass2;
+            long avail_bits = (orig_mdb[i] + main_data_slots) * 8;
+            long f_tot_p23 = 0;
+
             for (int gr = 0; gr < ngr0; gr++) {
                 for (int ch = 0; ch < nch0; ch++) {
                     int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
@@ -537,8 +531,10 @@ int repair_file(const char *in_path, const char *out_path) {
                         if (gg > 200 && gg != 210) frame_corrupt[i] = 1;
                         if (ws && get_bits(si, tbl_bp, 2) == 0) frame_corrupt[i] = 1;
                     }
+                    f_tot_p23 += p23;
                 }
             }
+            if (f_tot_p23 > avail_bits) frame_corrupt[i] = 1;
         }
 
         // Expand near_corrupt mask by +/- 6 frames around corrupt clusters
@@ -1006,6 +1002,41 @@ int repair_file(const char *in_path, const char *out_path) {
             }
         }
 
+        // Final safety pass: guarantee no frame overreads available bits
+        for (int i = 0; i < nframes; i++) {
+            if (i == 0 && has_xing) continue;
+            long f_off = frame_offs[i];
+            int fs = frame_sizes[i];
+            if (f_off + hdr_len0 + si_len0_pass2 > end_pos) continue;
+
+            uint8_t *si = data + f_off + hdr_len0;
+            uint32_t mdb = get_bits(si, 0, mdb_bits0);
+            long main_data_slots = fs - hdr_len0 - si_len0_pass2;
+            long avail_bits = (mdb + main_data_slots) * 8;
+
+            long total_p23 = 0;
+            for (int gr = 0; gr < ngr0; gr++) {
+                for (int ch = 0; ch < nch0; ch++) {
+                    int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                    total_p23 += get_bits(si, bp, 12);
+                }
+            }
+
+            if (total_p23 > avail_bits) {
+                long diff = total_p23 - avail_bits;
+                for (int gr = ngr0 - 1; gr >= 0 && diff > 0; gr--) {
+                    for (int ch = nch0 - 1; ch >= 0 && diff > 0; ch--) {
+                        if (file_ch1_is_silent && ch == 1) continue;
+                        int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                        uint32_t p = get_bits(si, bp, 12);
+                        uint32_t sub = (diff < p) ? diff : p;
+                        set_bits(si, bp, 12, p - sub);
+                        diff -= sub;
+                    }
+                }
+            }
+        }
+
         free(near_corrupt);
         free(orig_mdb);
     }
@@ -1034,9 +1065,23 @@ int repair_file(const char *in_path, const char *out_path) {
         }
     }
 
+    long out_len = fsize;
+    if (nframes > 0) {
+        long audio_end = frame_offs[nframes - 1] + frame_sizes[nframes - 1];
+        if (audio_end < end_pos) {
+            // Trailing sub-frame garbage / zero padding between audio and EOF/TAG
+            if (has_id3v1) {
+                memmove(data + audio_end, data + fsize - 128, 128);
+                out_len = audio_end + 128;
+            } else {
+                out_len = audio_end;
+            }
+        }
+    }
+
     FILE *out = fopen(out_path, "wb");
     if (!out) { free(data); free(frame_offs); free(frame_sizes); free(frame_corrupt); return -1; }
-    fwrite(data, 1, fsize, out);
+    fwrite(data, 1, out_len, out);
     fclose(out);
 
     if (has_stat) {

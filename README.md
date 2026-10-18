@@ -4,7 +4,7 @@ Detect and **contain** bit-rot damage in MP3 files (SD cards, cheap flash drives
 cleanly again instead of glitching, screeching, or stopping. Two small C tools, no GUI, one dependency
 (`libavutil` for the CRC table).
 
-This project started as me helping my mom to fix her broken SD Card containing thousands of islamic audio contained within MP3 Files (lossy btw). All of the code is written by AI, as I cannot analyze the bit to know X bit is the problem. This thing is made on my off hours for like 4 hrs. Feel free to modify and criticize this.
+This project started as me helping my mom to fix her broken SD Card containing thousands of islamic audio contained within MP3 Files (lossy btw). All of the code is written by AI, as I cannot analyze the bit to know X bit is the problem. This thing is made on my off hours for like 4 hrs. Feel free to modify and criticize this. Also I will never update this by writing the code myself, I cannot even understand those magic numbers.
 
 > [!IMPORTANT]
 > **This is damage containment, not lossless recovery.** It makes a corrupted MP3 *decode without errors and

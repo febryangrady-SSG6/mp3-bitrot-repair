@@ -1,0 +1,10 @@
+# build artifacts
+/scan_mp3
+/repair_mp3
+*.o
+
+# never commit media or file lists
+*.mp3
+*.MP3
+filelist*.txt
+*_list.txt

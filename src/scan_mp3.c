@@ -214,7 +214,8 @@ static int scan_one_file(const char *path, const AVCRC *crc_tbl) {
             int ngr = (v == 3) ? 2 : 1;
             int nch = (cm == 3 ? 1 : 2);
             int mdb = get_bits(si, &bp, (v == 3) ? 9 : 8);
-            if (mdb > reservoir_bytes) bad_backstep++;
+            if (mdb > reservoir_bytes + 64) bad_backstep++;
+            if (reservoir_bytes < mdb) reservoir_bytes = mdb;
             get_bits(si, &bp, (v == 3) ? (nch == 1 ? 5 : 3) : (nch == 1 ? 1 : 2));
             if (v == 3) get_bits(si, &bp, nch * 4);
             long total_p23_bits = 0;

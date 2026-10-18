@@ -108,6 +108,16 @@ static int popcnt32(uint32_t x) {
     return __builtin_popcount(x);
 }
 
+static int cmp_int(const void *a, const void *b) {
+    return (*(const int *)a - *(const int *)b);
+}
+
+static int calc_median(int *arr, int n) {
+    if (n <= 0) return 0;
+    qsort(arr, n, sizeof(int), cmp_int);
+    return arr[n / 2];
+}
+
 static uint32_t make_hdr_u32(int v, int l, int p, int bi, int si, int pad, int cm, uint8_t b3_low6) {
     uint8_t h[4];
     h[0] = 0xFF;
@@ -460,272 +470,283 @@ int repair_file(const char *in_path, const char *out_path) {
         }
     }
 
-    // Pass 2a: Repair Side Information & Bit Reservoir across all frames!
-    long reservoir_bytes = 0;
-    for (int i = 0; i < nframes; i++) {
-        if (i == 0 && has_xing) {
-            reservoir_bytes = 0;
-            continue;
-        }
-        long f_off = frame_offs[i];
-        int fs = frame_sizes[i];
-        int v, l, p, bi, si_idx, pad, cm, dummy_fs;
-        if (!parse_header(data + f_off, &v, &l, &p, &bi, &si_idx, &pad, &cm, &dummy_fs)) continue;
-        if (l != 1) continue; // Only Layer III has side info
+    // Pass 2: Targeted Layer III Side-Information, MDB Single-Bit-Flip & De-Clicking Engine
+    if (l0 == 1 && nframes > 0) {
+        uint8_t *near_corrupt = calloc(nframes, 1);
+        uint32_t *orig_mdb = malloc(nframes * sizeof(uint32_t));
 
-        int hdr_len = 4 + (p == 0 ? 2 : 0);
-        int si_len = (v == 3) ? (cm == 3 ? 17 : 32) : (cm == 3 ? 9 : 17);
-        if (f_off + hdr_len + si_len > end_pos) continue;
+        int hdr_len0 = 4 + (p0 == 0 ? 2 : 0);
+        int si_len0_pass2 = (v0 == 3) ? (cm0 == 3 ? 17 : 32) : (cm0 == 3 ? 9 : 17);
+        int ngr0 = (v0 == 3) ? 2 : 1;
+        int nch0 = (cm0 == 3) ? 1 : 2;
+        int mdb_bits0 = (v0 == 3) ? 9 : 8;
+        int priv_bits0 = (v0 == 3) ? (nch0 == 1 ? 5 : 3) : (nch0 == 1 ? 1 : 2);
+        int scfsi_bits0 = (v0 == 3) ? (nch0 * 4) : 0;
+        int gr_bits0 = (v0 == 3) ? 59 : 63;
+        int sfc_len0 = (v0 == 3) ? 4 : 9;
+        int base_bp0 = mdb_bits0 + priv_bits0 + scfsi_bits0;
 
-        uint8_t *si = data + f_off + hdr_len;
-        int ngr = (v == 3) ? 2 : 1;
-        int nch = (cm == 3) ? 1 : 2;
-        int mdb_bits = (v == 3) ? 9 : 8;
-        int priv_bits = (v == 3) ? (nch == 1 ? 5 : 3) : (nch == 1 ? 1 : 2);
-        int scfsi_bits = (v == 3) ? (nch * 4) : 0;
-        int gr_bits = (v == 3) ? 59 : 63;
-
-        uint32_t mdb = get_bits(si, 0, mdb_bits);
-        // 1. Ensure mdb <= reservoir_bytes!
-        if ((long)mdb > reservoir_bytes) {
-            frame_corrupt[i] = 1;
-            for (int b = mdb_bits - 1; b >= 0; b--) {
-                if ((mdb & (1 << b)) && (long)(mdb & ~(1 << b)) <= reservoir_bytes) {
-                    mdb &= ~(1 << b);
-                    break;
-                }
-            }
-            if ((long)mdb > reservoir_bytes) mdb = reservoir_bytes;
-            set_bits(si, 0, mdb_bits, mdb);
-        }
-
-        int near_corrupt = 0;
-        for (int k = (i >= 15 ? i - 15 : 0); k <= (i + 15 < nframes ? i + 15 : nframes - 1); k++) {
-            if (frame_corrupt[k]) { near_corrupt = 1; break; }
-        }
-
-        int base_bp = mdb_bits + priv_bits + scfsi_bits;
-        long total_p23 = 0;
-        for (int gr = 0; gr < ngr; gr++) {
-            for (int ch = 0; ch < nch; ch++) {
-                int bp = base_bp + (gr * nch + ch) * gr_bits;
-                uint32_t p23 = get_bits(si, bp, 12);
-                uint32_t bv  = get_bits(si, bp + 12, 9);
-                uint32_t gg  = get_bits(si, bp + 21, 8);
-                int sfc_len  = (v == 3) ? 4 : 9;
-                uint32_t ws  = get_bits(si, bp + 29 + sfc_len, 1);
-
-                // 2. Fix bv > 288
-                if (bv > 288) {
-                    frame_corrupt[i] = 1;
-                    near_corrupt = 1;
-                    bv &= 0xFF;
-                    if (bv > 288) bv &= 0x7F;
-                    set_bits(si, bp + 12, 9, bv);
-                }
-
-                // 3. Fix illegal ws=1, bt=0 or reserved Huffman table_select (4 or 14)
-                int tbl_bp = bp + 30 + sfc_len;
-                if (ws) {
-                    uint32_t bt = get_bits(si, tbl_bp, 2);
-                    if (bt == 0) {
-                        frame_corrupt[i] = 1;
-                        near_corrupt = 1;
-                        ws = 0;
-                        set_bits(si, bp + 29 + sfc_len, 1, 0);
-                    } else {
-                        for (int t = 0; t < 2; t++) {
-                            uint32_t ts = get_bits(si, tbl_bp + 3 + t * 5, 5);
-                            if (ts == 4) set_bits(si, tbl_bp + 3 + t * 5, 5, 0);
-                            if (ts == 14) set_bits(si, tbl_bp + 3 + t * 5, 5, 15);
-                        }
-                    }
-                }
-                if (!ws) {
-                    for (int t = 0; t < 3; t++) {
-                        uint32_t ts = get_bits(si, tbl_bp + t * 5, 5);
-                        if (ts == 4) set_bits(si, tbl_bp + t * 5, 5, 0);
-                        if (ts == 14) set_bits(si, tbl_bp + t * 5, 5, 15);
-                    }
-                }
-
-                // 4. If near_corrupt, clamp extreme global_gain spikes (> 200)
-                if (near_corrupt && gg > 200 && gg != 210) {
-                    gg &= ~0x40;
-                    set_bits(si, bp + 21, 8, gg);
-                }
-
-                total_p23 += p23;
-            }
-        }
-
-        // 5. Ensure total_p23 <= avail_bits!
-        long main_data_slots = fs - hdr_len - si_len;
-        long avail_bits = (mdb + main_data_slots) * 8;
-        if (total_p23 > avail_bits) {
-            frame_corrupt[i] = 1;
-            // First zero out any suspect silent granule (gg == 210 or bv == 0) that has non-zero p23
-            for (int gc = 0; gc < ngr * nch; gc++) {
-                int bp = base_bp + gc * gr_bits;
-                uint32_t p23 = get_bits(si, bp, 12);
-                uint32_t bv  = get_bits(si, bp + 12, 9);
-                uint32_t gg  = get_bits(si, bp + 21, 8);
-                if (p23 > 0 && (gg == 210 || bv == 0)) {
-                    set_bits(si, bp, 12, 0);
-                    set_bits(si, bp + 12, 9, 0);
-                    total_p23 -= p23;
-                }
-            }
-            while (total_p23 > avail_bits) {
-                int max_idx = 0;
-                uint32_t max_p23 = 0;
-                for (int gc = 0; gc < ngr * nch; gc++) {
-                    int bp = base_bp + gc * gr_bits;
-                    uint32_t p23 = get_bits(si, bp, 12);
-                    if (p23 > max_p23) { max_p23 = p23; max_idx = gc; }
-                }
-                if (max_p23 == 0) break;
-                int bp = base_bp + max_idx * gr_bits;
-                uint32_t new_p23 = max_p23;
-                for (int b = 11; b >= 0; b--) {
-                    if (new_p23 & (1 << b)) {
-                        new_p23 &= ~(1 << b);
-                        break;
-                    }
-                }
-                set_bits(si, bp, 12, new_p23);
-                total_p23 -= (max_p23 - new_p23);
-            }
-        }
-
-        reservoir_bytes = (avail_bits - total_p23) / 8;
-        if (reservoir_bytes < 0) reservoir_bytes = 0;
-        long max_res = (v == 3) ? 511 : 255;
-        if (reservoir_bytes > max_res) reservoir_bytes = max_res;
-    }
-
-    // Pass 2b: Acoustic De-Clicking (Silent-Granule / Local Median gg, bv, and Huffman linbits consistency)
-    if (l0 == 1 && nframes > 4) {
-        for (int i = 1; i < nframes; i++) {
-            long f_off = frame_offs[i];
-            int v, l, p, bi, si_idx, pad, cm, dummy_fs;
-            if (!parse_header(data + f_off, &v, &l, &p, &bi, &si_idx, &pad, &cm, &dummy_fs) || l != 1) continue;
-            int ngr = (v == 3) ? 2 : 1;
-            int nch = (cm == 3) ? 1 : 2;
-            int hdr_len = 4 + (p == 0 ? 2 : 0);
-            int si_len = (v == 3) ? (cm == 3 ? 17 : 32) : (cm == 3 ? 9 : 17);
-            if (f_off + hdr_len + si_len > end_pos) continue;
-            int mdb_bits = (v == 3) ? 9 : 8;
-            int priv_bits = (v == 3) ? (nch == 1 ? 5 : 3) : (nch == 1 ? 1 : 2);
-            int scfsi_bits = (v == 3) ? (nch * 4) : 0;
-            int gr_bits = (v == 3) ? 59 : 63;
-            int sfc_len = (v == 3) ? 4 : 9;
-            int base_bp = mdb_bits + priv_bits + scfsi_bits;
-            uint8_t *si = data + f_off + hdr_len;
-
-            for (int ch = 0; ch < nch; ch++) {
-                // Sample window [i-20 .. i+20] for this channel
-                int silent_cnt = 0, total_cnt = 0;
-                int gg_sum = 0, bv_sum = 0, act_cnt = 0;
-                for (int k = (i >= 20 ? i - 20 : 1); k <= (i + 20 < nframes ? i + 20 : nframes - 1); k++) {
-                    if (k == i) continue;
-                    long k_off = frame_offs[k];
-                    int kv, kl, kp, kbi, ksi_idx, kpad, kcm, kfs;
-                    if (!parse_header(data + k_off, &kv, &kl, &kp, &kbi, &ksi_idx, &kpad, &kcm, &kfs) || kcm != cm || kv != v) continue;
-                    if (k_off + hdr_len + si_len > end_pos) continue;
-                    const uint8_t *ksi = data + k_off + hdr_len;
-                    for (int gr = 0; gr < ngr; gr++) {
-                        int bp = base_bp + (gr * nch + ch) * gr_bits;
-                        uint32_t p23 = get_bits(ksi, bp, 12);
-                        uint32_t bv  = get_bits(ksi, bp + 12, 9);
-                        uint32_t gg  = get_bits(ksi, bp + 21, 8);
-                        total_cnt++;
-                        if (p23 == 0 && bv == 0) {
-                            silent_cnt++;
-                        } else if (p23 > 32 && gg < 195 && bv <= 200) {
-                            gg_sum += gg;
-                            bv_sum += bv;
-                            act_cnt++;
-                        }
-                    }
-                }
-                int ch_is_silent = (total_cnt >= 10 && silent_cnt * 10 >= total_cnt * 8);
-                int avg_gg = (act_cnt > 0) ? (gg_sum / act_cnt) : 160;
-                int avg_bv = (act_cnt > 0) ? (bv_sum / act_cnt) : 66;
-
-                for (int gr = 0; gr < ngr; gr++) {
-                    int bp = base_bp + (gr * nch + ch) * gr_bits;
+        // Check if channel 1 is predominantly silent (Mid/Side Joint Stereo)
+        int ch1_silent_count = 0, ch1_total_count = 0;
+        if (nch0 == 2) {
+            for (int i = 0; i < nframes; i++) {
+                if (i == 0 && has_xing) continue;
+                long f_off = frame_offs[i];
+                if (f_off + hdr_len0 + si_len0_pass2 > end_pos) continue;
+                uint8_t *si = data + f_off + hdr_len0;
+                for (int gr = 0; gr < ngr0; gr++) {
+                    int bp = base_bp0 + (gr * nch0 + 1) * gr_bits0;
                     uint32_t p23 = get_bits(si, bp, 12);
                     uint32_t bv  = get_bits(si, bp + 12, 9);
                     uint32_t gg  = get_bits(si, bp + 21, 8);
-                    uint32_t ws  = get_bits(si, bp + 29 + sfc_len, 1);
+                    ch1_total_count++;
+                    if (p23 == 0 && bv == 0 && gg == 210) ch1_silent_count++;
+                }
+            }
+        }
+        int file_ch1_is_silent = (ch1_total_count > 10 && ch1_silent_count * 10 >= ch1_total_count * 7);
 
-                    if (ch_is_silent && (p23 != 0 || bv != 0 || gg != 210)) {
-                        if (ch == 1 && nch == 2) {
-                            int bp0 = base_bp + (gr * nch + 0) * gr_bits;
-                            uint32_t p23_0 = get_bits(si, bp0, 12);
-                            if (p23_0 > 0 && p23_0 < 300 && p23 >= 512) {
-                                set_bits(si, bp0, 12, p23_0 + 512);
-                            }
-                        }
-                        set_bits(si, bp, 12, 0);
-                        set_bits(si, bp + 12, 9, 0);
-                        set_bits(si, bp + 21, 8, 210);
-                        set_bits(si, bp + 29, sfc_len, 0);
-                        set_bits(si, bp + 29 + sfc_len, 1, 0);
-                        continue;
-                    }
+        // Identify corrupted frames
+        for (int i = 0; i < nframes; i++) {
+            if (i == 0 && has_xing) { orig_mdb[i] = 0; continue; }
+            long f_off = frame_offs[i];
+            if (f_off + hdr_len0 + si_len0_pass2 > end_pos) { orig_mdb[i] = 0; continue; }
+            uint8_t *si = data + f_off + hdr_len0;
+            orig_mdb[i] = get_bits(si, 0, mdb_bits0);
 
-                    // In ANY channel, if p23 == 0 or gg == 210 with tiny/power-of-2 p23, bv and p23 must be 0!
-                    if (p23 == 0 || (gg == 210 && (bv == 0 || p23 <= 64 || (p23 & (p23 - 1)) == 0))) {
-                        if (p23 != 0 || bv != 0) {
-                            set_bits(si, bp, 12, 0);
-                            set_bits(si, bp + 12, 9, 0);
-                            set_bits(si, bp + 29, sfc_len, 0);
-                            set_bits(si, bp + 29 + sfc_len, 1, 0);
-                        }
-                        continue;
-                    }
+            if (frame_corrupt[i]) continue;
 
-                    // Active granule: clamp extreme bv and gg outliers and high-linbits Huffman table_select
-                    if (act_cnt >= 4) {
-                        if ((int)bv > avg_bv + 40 || ((int)bv < avg_bv - 40 && avg_bv > 50)) {
-                            set_bits(si, bp + 12, 9, avg_bv);
-                        }
-                        if ((int)gg > avg_gg + 10 || (int)gg < avg_gg - 25) {
-                            set_bits(si, bp + 21, 8, avg_gg);
-                        }
-                    }
-                    int tbl_bp = bp + 30 + sfc_len;
-                    if (ws && avg_bv >= 50) {
-                        uint32_t t0 = get_bits(si, tbl_bp, 5);
-                        uint32_t t1 = get_bits(si, tbl_bp + 5, 5);
-                        if (t0 >= 15 && t1 >= 15) {
-                            ws = 0;
-                            set_bits(si, bp + 29 + sfc_len, 1, 0);
-                        }
-                    }
-                    if (!ws) {
-                        for (int t = 0; t < 3; t++) {
-                            uint32_t ts = get_bits(si, tbl_bp + t * 5, 5);
-                            if (ts >= 28 || ts == 22 || ts == 23) {
-                                set_bits(si, tbl_bp + t * 5, 5, ts & ~4);
-                            } else if (ts < 15 && avg_bv >= 50) {
-                                set_bits(si, tbl_bp + t * 5, 5, 24 | (ts & 3));
-                            }
-                        }
-                        if (v == 3 && avg_bv >= 50) {
-                            uint32_t r0 = get_bits(si, tbl_bp + 15, 4);
-                            uint32_t r1 = get_bits(si, tbl_bp + 19, 3);
-                            if (r0 != 4 && r0 != 5 && r0 != 6 && r0 != 7) set_bits(si, tbl_bp + 15, 4, 4);
-                            if (r1 != 5 && r1 != 4 && r1 != 3) set_bits(si, tbl_bp + 19, 3, 5);
-                            set_bits(si, tbl_bp + 22, 1, 0);
-                            set_bits(si, tbl_bp + 23, 1, 0);
-                        }
+            for (int gr = 0; gr < ngr0; gr++) {
+                for (int ch = 0; ch < nch0; ch++) {
+                    int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                    uint32_t p23 = get_bits(si, bp, 12);
+                    uint32_t bv  = get_bits(si, bp + 12, 9);
+                    uint32_t gg  = get_bits(si, bp + 21, 8);
+                    uint32_t ws  = get_bits(si, bp + 29 + sfc_len0, 1);
+                    int tbl_bp = bp + 30 + sfc_len0;
+
+                    if (file_ch1_is_silent && ch == 1) {
+                        if (p23 > 0 || bv > 0 || gg != 210) frame_corrupt[i] = 1;
+                    } else {
+                        if (p23 > 1500 || bv > 288) frame_corrupt[i] = 1;
+                        if (gg > 200 && gg != 210) frame_corrupt[i] = 1;
+                        if (ws && get_bits(si, tbl_bp, 2) == 0) frame_corrupt[i] = 1;
                     }
                 }
             }
         }
+
+        // Expand near_corrupt mask by +/- 6 frames around corrupt clusters
+        for (int i = 0; i < nframes; i++) {
+            if (frame_corrupt[i]) {
+                int k0 = (i >= 6) ? i - 6 : 0;
+                int k1 = (i + 6 < nframes) ? i + 6 : nframes - 1;
+                for (int k = k0; k <= k1; k++) near_corrupt[k] = 1;
+            }
+        }
+
+        // Compute reference medians from UNCORRUPTED frames
+        int *clean_p23 = malloc(nframes * 4 * sizeof(int));
+        int *clean_bv  = malloc(nframes * 4 * sizeof(int));
+        int *clean_gg  = malloc(nframes * 4 * sizeof(int));
+        int *clean_ws  = malloc(nframes * 4 * sizeof(int));
+        int clean_cnt = 0;
+
+        for (int i = 0; i < nframes; i++) {
+            if (near_corrupt[i]) continue;
+            long f_off = frame_offs[i];
+            if (f_off + hdr_len0 + si_len0_pass2 > end_pos) continue;
+            uint8_t *si = data + f_off + hdr_len0;
+            for (int gr = 0; gr < ngr0; gr++) {
+                int bp = base_bp0 + (gr * nch0 + 0) * gr_bits0;
+                uint32_t p23 = get_bits(si, bp, 12);
+                uint32_t bv  = get_bits(si, bp + 12, 9);
+                uint32_t gg  = get_bits(si, bp + 21, 8);
+                uint32_t ws  = get_bits(si, bp + 29 + sfc_len0, 1);
+                if (p23 > 0) {
+                    clean_p23[clean_cnt] = p23;
+                    clean_bv[clean_cnt]  = bv;
+                    clean_gg[clean_cnt]  = gg;
+                    clean_ws[clean_cnt]  = ws;
+                    clean_cnt++;
+                }
+            }
+        }
+
+        int med_p23 = clean_cnt > 0 ? calc_median(clean_p23, clean_cnt) : 690;
+        int med_bv  = clean_cnt > 0 ? calc_median(clean_bv, clean_cnt)  : 66;
+        int med_gg  = clean_cnt > 0 ? calc_median(clean_gg, clean_cnt)  : 160;
+        int med_ws  = clean_cnt > 0 ? calc_median(clean_ws, clean_cnt)  : 0;
+        free(clean_p23); free(clean_bv); free(clean_gg); free(clean_ws);
+
+        // MDB single-bit flip repair
+        int mdb_window[11];
+        for (int i = 0; i < nframes; i++) {
+            if (!near_corrupt[i]) continue;
+            int wcnt = 0;
+            int k0 = (i >= 5) ? i - 5 : 0;
+            int k1 = (i + 5 < nframes) ? i + 5 : nframes - 1;
+            for (int k = k0; k <= k1; k++) {
+                if (!near_corrupt[k]) mdb_window[wcnt++] = orig_mdb[k];
+            }
+            if (wcnt == 0) {
+                for (int k = k0; k <= k1; k++) mdb_window[wcnt++] = orig_mdb[k];
+            }
+            int med_m = calc_median(mdb_window, wcnt);
+            int cur_m = orig_mdb[i];
+            if (abs(cur_m - med_m) > 40) {
+                for (int b = 0; b < mdb_bits0; b++) {
+                    int cand = cur_m ^ (1 << b);
+                    if (abs(cand - med_m) <= 35) {
+                        orig_mdb[i] = cand;
+                        long f_off = frame_offs[i];
+                        uint8_t *si = data + f_off + hdr_len0;
+                        set_bits(si, 0, mdb_bits0, cand);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Execute targeted repair & reservoir tracking
+        long reservoir_bytes = 0;
+        for (int i = 0; i < nframes; i++) {
+            if (i == 0 && has_xing) {
+                reservoir_bytes = 0;
+                continue;
+            }
+            long f_off = frame_offs[i];
+            int fs = frame_sizes[i];
+            if (f_off + hdr_len0 + si_len0_pass2 > end_pos) continue;
+
+            uint8_t *si = data + f_off + hdr_len0;
+            uint32_t mdb = get_bits(si, 0, mdb_bits0);
+
+            if (near_corrupt[i]) {
+                // Repair silent channel if present
+                if (file_ch1_is_silent && nch0 == 2) {
+                    for (int gr = 0; gr < ngr0; gr++) {
+                        int bp = base_bp0 + (gr * nch0 + 1) * gr_bits0;
+                        set_bits(si, bp, 12, 0);
+                        set_bits(si, bp + 12, 9, 0);
+                        set_bits(si, bp + 21, 8, 210);
+                        set_bits(si, bp + 29, sfc_len0, 0);
+                        set_bits(si, bp + 29 + sfc_len0, 1, 0);
+                    }
+                }
+
+                // Repair active channel
+                int active_ch_end = (file_ch1_is_silent && nch0 == 2) ? 1 : nch0;
+                for (int gr = 0; gr < ngr0; gr++) {
+                    for (int ch = 0; ch < active_ch_end; ch++) {
+                        int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                        uint32_t p23 = get_bits(si, bp, 12);
+                        uint32_t bv  = get_bits(si, bp + 12, 9);
+                        uint32_t gg  = get_bits(si, bp + 21, 8);
+                        uint32_t ws  = get_bits(si, bp + 29 + sfc_len0, 1);
+                        int tbl_bp = bp + 30 + sfc_len0;
+
+                        // Single bit-flip repair for p23
+                        if (abs((int)p23 - med_p23) >= 300) {
+                            for (int b = 11; b >= 9; b--) {
+                                if (abs((int)(p23 ^ (1 << b)) - med_p23) < 300) {
+                                    p23 ^= (1 << b);
+                                    set_bits(si, bp, 12, p23);
+                                    break;
+                                }
+                            }
+                        }
+                        if (p23 >= 2048) { p23 &= ~2048; set_bits(si, bp, 12, p23); }
+                        if (p23 >= 1024 && (int)p23 - 1024 > 300) { p23 &= ~1024; set_bits(si, bp, 12, p23); }
+
+                        // Single bit-flip repair for bv
+                        if (abs((int)bv - med_bv) >= 25) {
+                            for (int b = 8; b >= 5; b--) {
+                                if (abs((int)(bv ^ (1 << b)) - med_bv) <= 10) {
+                                    bv ^= (1 << b);
+                                    set_bits(si, bp + 12, 9, bv);
+                                    break;
+                                }
+                            }
+                        }
+                        if (bv > 288) { bv &= 0x7F; set_bits(si, bp + 12, 9, bv); }
+
+                        // Single bit-flip repair for gg
+                        if (abs((int)gg - med_gg) >= 15) {
+                            for (int b = 7; b >= 4; b--) {
+                                if (abs((int)(gg ^ (1 << b)) - med_gg) <= 6) {
+                                    gg ^= (1 << b);
+                                    set_bits(si, bp + 21, 8, gg);
+                                    break;
+                                }
+                            }
+                        }
+                        if (gg > 195 && gg != 210) { gg &= ~0x40; set_bits(si, bp + 21, 8, gg); }
+
+                        // ws flag
+                        if (med_ws == 0 && ws) {
+                            ws = 0;
+                            set_bits(si, bp + 29 + sfc_len0, 1, 0);
+                        } else if (ws && get_bits(si, tbl_bp, 2) == 0) {
+                            ws = 0;
+                            set_bits(si, bp + 29 + sfc_len0, 1, 0);
+                        }
+
+                        // Table select reserved / high linbits check
+                        if (ws) {
+                            for (int t = 0; t < 2; t++) {
+                                uint32_t ts = get_bits(si, tbl_bp + 3 + t * 5, 5);
+                                if (ts == 4) set_bits(si, tbl_bp + 3 + t * 5, 5, 0);
+                                else if (ts == 14) set_bits(si, tbl_bp + 3 + t * 5, 5, 15);
+                                else if (ts >= 28) set_bits(si, tbl_bp + 3 + t * 5, 5, ts & ~4);
+                            }
+                        } else {
+                            for (int t = 0; t < 3; t++) {
+                                uint32_t ts = get_bits(si, tbl_bp + t * 5, 5);
+                                if (ts == 4) set_bits(si, tbl_bp + t * 5, 5, 0);
+                                else if (ts == 14) set_bits(si, tbl_bp + t * 5, 5, 15);
+                                else if (ts >= 28) set_bits(si, tbl_bp + t * 5, 5, ts & ~4);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bit reservoir invariant (prevent cascade underflow!)
+            if (reservoir_bytes < (long)mdb) reservoir_bytes = mdb;
+            long main_data_slots = fs - hdr_len0 - si_len0_pass2;
+            long avail_bits = (mdb + main_data_slots) * 8;
+
+            long total_p23 = 0;
+            for (int gr = 0; gr < ngr0; gr++) {
+                for (int ch = 0; ch < nch0; ch++) {
+                    int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                    total_p23 += get_bits(si, bp, 12);
+                }
+            }
+
+            if (total_p23 > avail_bits && near_corrupt[i]) {
+                long diff = total_p23 - avail_bits;
+                for (int gr = ngr0 - 1; gr >= 0 && diff > 0; gr--) {
+                    for (int ch = nch0 - 1; ch >= 0 && diff > 0; ch--) {
+                        int bp = base_bp0 + (gr * nch0 + ch) * gr_bits0;
+                        uint32_t p = get_bits(si, bp, 12);
+                        uint32_t sub = (diff < p) ? diff : p;
+                        set_bits(si, bp, 12, p - sub);
+                        diff -= sub;
+                    }
+                }
+                total_p23 = avail_bits;
+            }
+
+            reservoir_bytes = (avail_bits - total_p23) / 8;
+            if (reservoir_bytes < 0) reservoir_bytes = 0;
+            long max_res = (v0 == 3) ? 511 : 255;
+            if (reservoir_bytes > max_res) reservoir_bytes = max_res;
+        }
+
+        free(near_corrupt);
+        free(orig_mdb);
     }
 
     // Pass 3: If Frame 0 has a Lavc / LAME Info CRC, update it so the repaired file has a valid CRC!
